@@ -71,19 +71,35 @@ def run(
     rgb_list: list[np.ndarray] = []
     points_before_merge = 0
     processed = 0
+    pair_stats: list[dict] = []
 
     for idx, pair in enumerate(pairs):
         _cb("stereo", f"Pair {idx + 1}/{len(pairs)}: {pair.cam_i.direction} ↔ {pair.cam_j.direction}", idx, len(pairs))
+        n_pts = 0
+        ok = False
         try:
             result = process_pair(pair.cam_i, pair.cam_j, debug_dir=debug_dir, pair_idx=idx, max_points=max_points)
             if result is not None:
                 xyz, rgb = result
+                n_pts = len(xyz)
                 xyz_list.append(xyz)
                 rgb_list.append(rgb)
-                points_before_merge += len(xyz)
+                points_before_merge += n_pts
                 processed += 1
+                ok = True
         except Exception as exc:
             logger.warning("Pair %d failed: %s", idx, exc, exc_info=True)
+        pair_stats.append({
+            "idx": idx + 1,
+            "dir_i": pair.cam_i.direction,
+            "id_i": pair.cam_i.item_id[-8:],
+            "dir_j": pair.cam_j.direction,
+            "id_j": pair.cam_j.item_id[-8:],
+            "baseline": pair.baseline,
+            "score": pair.score,
+            "points": n_pts,
+            "ok": ok,
+        })
     _cb("stereo", f"{processed}/{len(pairs)} pairs succeeded", len(pairs), len(pairs))
 
     logger.info("Pairs processed: %d / %d selected", processed, len(pairs))
@@ -106,6 +122,7 @@ def run(
         "pairs_processed": processed,
         "points_before_merge": points_before_merge,
         "points_after_merge": len(pcd.points),
+        "pair_stats": pair_stats,
     }
     return pcd, stats
 
