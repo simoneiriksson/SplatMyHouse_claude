@@ -542,3 +542,31 @@ OPK→rotation as Rκ@Rφ@Rω, uncalibrated stereo rectification with SIFT+BFMat
 SGBM disparity with 3σ depth filtering, open3d voxel downsample + statistical outlier removal,
 Click CLI with mutually-exclusive --address/--lonlat/--from-session modes, and full debug mode
 with per-pair outputs and matplotlib camera layout plot.
+
+### 2026-04-06 — Camera convention fix, calibrated rectification, pair scoring
+Rewrote camera.py to use correct OpenCV convention: API provides photogrammetric rotation
+(camera +Z away from scene), converted with `_flip = diag([1,-1,-1])` so cam.R[2,:] is the
+optical axis pointing into the scene. Switched stereo rectification from uncalibrated
+(stereoRectifyUncalibrated + SIFT) to calibrated (cv2.stereoRectify + K/R/t), eliminating
+dependency on feature matching for geometry. Replaced straight-line camera layout with
+ground-footprint-based pair scoring: each camera's principal ray is traced to the ground plane
+(ground_z=-1000m default) and pairs are ranked by how close the footprint midpoint is to the
+target (Gaussian proximity bonus, σ=500m). Added --scene-radius for XY cylinder crop and
+--scene-center / --ground-z CLI args. Updated Z filtering to Z-mode histogram peak with
+symmetric ±200m window. Added progress bars (tqdm) throughout the pipeline.
+
+### 2026-04-07/08 — Disparity sign swap, oblique pair wall geometry, git init
+Fixed a systematic bug where SGBM produced zero valid matches for all oblique pairs: when cam2
+is "left" of cam1 in rectified space, valid disparities are negative but SGBM only searches
+positive (minDisparity=0). Detection: sign of P2_rect[axis,3] from stereoRectify — positive Tx
+(or Ty for vertical stereo) means swap is needed. Fixed in _calibrated_rectify (stereo.py) which
+now returns a cam_swapped flag; process_pair swaps both homographies and camera objects when set.
+Added tilt-aware minimum depth for disparity pre-screening: min_depth = 1300m / cos(tilt) so
+oblique cameras (45°) use ~1838m instead of the flat 900m estimate that was falsely rejecting
+valid within-strip pairs. Replaced symmetric Z clip (±300m) with asymmetric [-30m, +100m] around
+Z-mode in both per-pair (stereo.py) and global (pointcloud.py) filtering — buildings extend above
+ground, never below, so tight below-ground clamping eliminates SGBM noise without clipping walls.
+Added Z-mode depth sanity check: pairs whose reconstructed Z-mode is >2500m below camera altitude
+are rejected as noise-only. Results: 14/15 pairs succeed across all 5 directions (nadir, south,
+east, west, north); 212k clean points; 54.7% above ground level confirming wall/rooftop geometry.
+Initialized git repository, added .gitignore (data/, *.ply, .env, etc.), created CLAUDE.md.
