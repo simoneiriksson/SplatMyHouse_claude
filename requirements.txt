@@ -1,0 +1,10 @@
+opencv-contrib-python>=4.9
+open3d>=0.18
+numpy>=1.26
+requests>=2.31
+scipy>=1.12
+tqdm>=4.66
+click>=8.1
+matplotlib>=3.8
+plotly>=5.18
+ipywidgets>=8.0
