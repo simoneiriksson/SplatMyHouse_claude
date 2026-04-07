@@ -199,7 +199,10 @@ def process_pair(
     # minimum depth (900 m ≈ low-flying camera) gives the max expected
     # full-resolution rectified disparity; scaling by sgbm_scale converts
     # it to SGBM-image pixels.
-    MIN_DEPTH_M = 900.0
+    # Minimum depth: altitude AGL / cos(tilt), matching pairs.py logic.
+    tilt_cos = abs((cam1.R[2, 2] + cam2.R[2, 2]) / 2.0)
+    tilt_cos = max(tilt_cos, 0.3)
+    MIN_DEPTH_M = 1300.0 / tilt_cos
     MAX_NUM_DISP = 512   # cap; beyond this SGBM is unreliable/slow
     d_expected_sgbm = disp_coeff * sgbm_scale / MIN_DEPTH_M
     if d_expected_sgbm > MAX_NUM_DISP:
@@ -339,9 +342,10 @@ def process_pair(
             )
             return None
 
-        keep &= (xyz[:, 2] >= z_mode - 200.0) & (xyz[:, 2] <= z_mode + 200.0)
+        # Asymmetric: buildings are above ground (up to 100 m); below-ground is noise.
+        keep &= (xyz[:, 2] >= z_mode - 30.0) & (xyz[:, 2] <= z_mode + 100.0)
         logger.debug("Pair %d: Z-mode=%.1f, kept Z in [%.1f, %.1f]",
-                     pair_idx, z_mode, z_mode - 200.0, z_mode + 200.0)
+                     pair_idx, z_mode, z_mode - 30.0, z_mode + 100.0)
 
     n_valid = int(keep.sum())
     if n_valid < MIN_VALID_POINTS:

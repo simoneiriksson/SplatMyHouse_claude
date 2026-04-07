@@ -63,12 +63,16 @@ def merge_pointclouds(
         hist_counts, hist_edges = np.histogram(pts_z, bins=100)
         peak_idx = int(np.argmax(hist_counts))
         z_mode = float((hist_edges[peak_idx] + hist_edges[peak_idx + 1]) / 2)
-        z_floor = z_mode - 300.0
-        z_ceil  = z_mode + 300.0
+        # Asymmetric clip: buildings go UP from the ground plane, never down.
+        # Allow generous margin above (100 m covers the tallest urban buildings)
+        # but clamp tightly below (30 m) to discard below-ground noise from
+        # oblique-pair mismatches while preserving ground-level measurement error.
+        z_floor = z_mode - 30.0
+        z_ceil  = z_mode + 100.0
         keep_z = np.where((pts_z >= z_floor) & (pts_z <= z_ceil))[0]
         pcd = pcd.select_by_index(keep_z.tolist())
-        logger.info("Points after Z-mode clip (mode=%.0f, ±300 m): %d",
-                    z_mode, len(pcd.points))
+        logger.info("Points after Z-mode clip (mode=%.0f, [%.0f, +100 m]): %d",
+                    z_mode, z_floor, len(pcd.points))
 
     # Estimate normals
     pcd.estimate_normals(

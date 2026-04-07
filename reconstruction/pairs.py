@@ -6,14 +6,14 @@ import numpy as np
 
 import cv2
 
-from reconstruction.camera import Camera, TARGET_LONG_EDGE
+from reconstruction.camera import Camera
 
 logger = logging.getLogger(__name__)
 
 # Match stereo.py constants — used for pre-screening pair disparity.
 _SGBM_LONG_EDGE = 800
-_MAX_SGBM_DISP = 512    # pairs with estimated disparity above this are skipped
-_MIN_SCENE_DEPTH = 900.0  # conservative minimum camera-to-ground depth (m)
+_MAX_SGBM_DISP = 512      # pairs with estimated disparity above this are skipped
+_ALTITUDE_AGL = 1300.0    # typical Skraafotos altitude above ground (m)
 
 
 def _estimate_pair_disparity(cam_i: Camera, cam_j: Camera) -> float:
@@ -23,6 +23,13 @@ def _estimate_pair_disparity(cam_i: Camera, cam_j: Camera) -> float:
 
     This is called during pair selection to pre-screen pairs that SGBM
     cannot process (disparity range exceeds image width).
+
+    The minimum scene depth is derived from the camera tilt angle:
+      - Nadir cameras (looking straight down): depth ≈ altitude AGL
+      - Oblique cameras at angle θ from nadir: depth ≈ altitude / cos(θ)
+    This avoids falsely rejecting valid oblique pairs (e.g. same-direction
+    adjacent-strip pairs) whose stereo geometry is sound but whose disp_coeff
+    is large because the rectified focal length is large.
     """
     img_size = (
         min(cam_i.image.shape[1], cam_j.image.shape[1]),
@@ -46,7 +53,15 @@ def _estimate_pair_disparity(cam_i: Camera, cam_j: Camera) -> float:
     Ty = abs(float(P2_rect[1, 3]))
     disp_coeff = max(Tx, Ty)
     sgbm_scale = _SGBM_LONG_EDGE / max(img_size)
-    return disp_coeff * sgbm_scale / _MIN_SCENE_DEPTH
+
+    # Minimum scene depth: altitude AGL / cos(tilt).
+    # cam.R[2,:] is the camera optical axis in world ENU; its z-component
+    # equals cos(tilt from vertical) since ENU z is Up.
+    tilt_cos = abs((R1[2, 2] + R2[2, 2]) / 2.0)
+    tilt_cos = max(tilt_cos, 0.3)   # clamp for nearly-horizontal cameras
+    min_depth = _ALTITUDE_AGL / tilt_cos
+
+    return disp_coeff * sgbm_scale / min_depth
 
 
 def _direction_bonus(d1: str, d2: str) -> float:
