@@ -72,11 +72,16 @@ def run(
     points_before_merge = 0
     processed = 0
     pair_stats: list[dict] = []
+    # Per-pair arrays for the interactive viewer (subsampled to save memory)
+    _VIEW_MAX = 15_000
+    pair_view_xyz: list[np.ndarray] = []
+    pair_view_rgb: list[np.ndarray] = []
 
     for idx, pair in enumerate(pairs):
         _cb("stereo", f"Pair {idx + 1}/{len(pairs)}: {pair.cam_i.direction} ↔ {pair.cam_j.direction}", idx, len(pairs))
         n_pts = 0
         ok = False
+        view_xyz = view_rgb = None
         try:
             result = process_pair(pair.cam_i, pair.cam_j, debug_dir=debug_dir, pair_idx=idx, max_points=max_points)
             if result is not None:
@@ -87,6 +92,14 @@ def run(
                 points_before_merge += n_pts
                 processed += 1
                 ok = True
+                # Subsample for the viewer
+                if n_pts > _VIEW_MAX:
+                    sel = np.random.choice(n_pts, _VIEW_MAX, replace=False)
+                    view_xyz = xyz[sel]
+                    view_rgb = rgb[sel]
+                else:
+                    view_xyz = xyz.copy()
+                    view_rgb = rgb.copy()
         except Exception as exc:
             logger.warning("Pair %d failed: %s", idx, exc, exc_info=True)
         pair_stats.append({
@@ -100,6 +113,8 @@ def run(
             "points": n_pts,
             "ok": ok,
         })
+        pair_view_xyz.append(view_xyz)
+        pair_view_rgb.append(view_rgb)
     _cb("stereo", f"{processed}/{len(pairs)} pairs succeeded", len(pairs), len(pairs))
 
     logger.info("Pairs processed: %d / %d selected", processed, len(pairs))
@@ -123,6 +138,8 @@ def run(
         "points_before_merge": points_before_merge,
         "points_after_merge": len(pcd.points),
         "pair_stats": pair_stats,
+        "pair_view_xyz": pair_view_xyz,
+        "pair_view_rgb": pair_view_rgb,
     }
     return pcd, stats
 
