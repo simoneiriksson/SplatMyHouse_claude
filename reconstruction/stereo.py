@@ -48,7 +48,7 @@ def _calibrated_rectify(
 
     dist_zeros = np.zeros(5)
     try:
-        R1_rect, R2_rect, P1_rect, P2_rect, _Q, _roi1, _roi2 = cv2.stereoRectify(
+        R1_rect, R2_rect, P1_rect, P2_rect, _Q, roi1, roi2 = cv2.stereoRectify(
             K1, dist_zeros,
             K2, dist_zeros,
             img_size,
@@ -87,11 +87,22 @@ def _calibrated_rectify(
     # We return this so process_pair can set numDisparities appropriately.
     disp_coeff = abs(Ty if disp_axis == 1 else Tx)  # f_rect × baseline (px·m)
 
+    # Report what fraction of the rectified image contains valid pixels.
+    # With alpha=0, the roi is the bounding box of valid (non-black) pixels.
+    # A small roi indicates heavy warping (typical for oblique cameras).
+    def _roi_area(roi, img_size):
+        _, _, w, h = roi
+        return (w * h) / (img_size[0] * img_size[1])
+
+    frac1 = _roi_area(roi1, img_size)
+    frac2 = _roi_area(roi2, img_size)
+    logger.debug("Pair: roi coverage cam1=%.0f%% cam2=%.0f%%", frac1 * 100, frac2 * 100)
+
     # Return homographies: H maps ORIGINAL → RECTIFIED pixel coordinates.
     # cv2.warpPerspective uses H as the forward (src→dst) transform.
     H1 = K1_new @ R1_rect @ np.linalg.inv(K1)
     H2 = K2_new @ R2_rect @ np.linalg.inv(K2)
-    return H1, H2, disp_axis, cam_swapped, disp_coeff
+    return H1, H2, disp_axis, cam_swapped, disp_coeff, roi1, roi2
 
 
 def process_pair(
@@ -150,7 +161,7 @@ def process_pair(
     if result is None:
         logger.warning("Pair %d: calibrated rectification failed", pair_idx)
         return None
-    H1, H2, disp_axis, cam_swapped, disp_coeff = result
+    H1, H2, disp_axis, cam_swapped, disp_coeff, roi1, roi2 = result
 
     # If cam2 is "left" of cam1 in rectified space, SGBM would need negative
     # disparity (minDisparity=0 blocks all valid matches).  Swap the pair so
@@ -160,7 +171,17 @@ def process_pair(
         img1_use, img2_use = img2_use, img1_use
         cam1_s, cam2_s = cam2_s, cam1_s
         cam1, cam2 = cam2, cam1
+        roi1, roi2 = roi2, roi1
         logger.debug("Pair %d: cameras swapped to ensure positive disparity", pair_idx)
+
+    # Log ROI coverage so we can see how much of the rectified image is valid.
+    # With alpha=0, pixels outside the ROI are black; for oblique cameras the
+    # valid region can be a small fraction of the full image.
+    def _roi_frac(roi):
+        _, _, w, h = roi
+        return w * h / (img_size[0] * img_size[1])
+    logger.info("Pair %d: rectified ROI coverage cam1=%.0f%% cam2=%.0f%%",
+                pair_idx, _roi_frac(roi1) * 100, _roi_frac(roi2) * 100)
 
     rect1 = cv2.warpPerspective(img1_use, H1, img_size)
     rect2 = cv2.warpPerspective(img2_use, H2, img_size)
@@ -244,7 +265,24 @@ def process_pair(
     # ------------------------------------------------------------------ #
     # 3. Triangulate via H1⁻¹, H2⁻¹, P1, P2
     # ------------------------------------------------------------------ #
-    valid_mask = disp_full > 1.0
+    # ROI validity mask: stereoRectify with alpha=0 fills pixels outside the
+    # valid overlap region with black (0).  For oblique cameras this border
+    # can be large.  SGBM matches black-on-black regions, producing spurious
+    # small-positive disparities that triangulate to garbage positions.
+    # Masking to the ROI intersection eliminates these false matches.
+    H_px, W_px = img_size[1], img_size[0]
+    roi_mask = np.zeros((H_px, W_px), dtype=bool)
+    x1, y1, w1, h1 = roi1
+    x2, y2, w2, h2 = roi2
+    # Intersection of both valid regions
+    ix = max(x1, x2);  iy = max(y1, y2)
+    ix2 = min(x1 + w1, x2 + w2);  iy2 = min(y1 + h1, y2 + h2)
+    if ix2 > ix and iy2 > iy:
+        roi_mask[iy:iy2, ix:ix2] = True
+    overlap_frac = roi_mask.sum() / roi_mask.size
+    logger.info("Pair %d: valid overlap region %.0f%% of image", pair_idx, overlap_frac * 100)
+
+    valid_mask = (disp_full > 1.0) & roi_mask
     if int(valid_mask.sum()) < MIN_VALID_POINTS:
         logger.warning("Pair %d: only %d valid disparity pixels",
                        pair_idx, int(valid_mask.sum()))
