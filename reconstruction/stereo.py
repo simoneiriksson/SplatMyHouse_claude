@@ -86,23 +86,15 @@ def _calibrated_rectify(
     # Dividing by depth (metres) gives the full-res rectified disparity.
     # We return this so process_pair can set numDisparities appropriately.
     disp_coeff = abs(Ty if disp_axis == 1 else Tx)  # f_rect × baseline (px·m)
+    f_rect = float(P1_rect[0, 0])
+    cx_rect = float(P1_rect[0, 2])
+    cy_rect = float(P1_rect[1, 2])
 
-    # Report what fraction of the rectified image contains valid pixels.
-    # With alpha=0, the roi is the bounding box of valid (non-black) pixels.
-    # A small roi indicates heavy warping (typical for oblique cameras).
-    def _roi_area(roi, img_size):
-        _, _, w, h = roi
-        return (w * h) / (img_size[0] * img_size[1])
-
-    frac1 = _roi_area(roi1, img_size)
-    frac2 = _roi_area(roi2, img_size)
-    logger.debug("Pair: roi coverage cam1=%.0f%% cam2=%.0f%%", frac1 * 100, frac2 * 100)
-
-    # Return homographies: H maps ORIGINAL → RECTIFIED pixel coordinates.
-    # cv2.warpPerspective uses H as the forward (src→dst) transform.
+    # Homographies for warping images into the rectified frame.
     H1 = K1_new @ R1_rect @ np.linalg.inv(K1)
     H2 = K2_new @ R2_rect @ np.linalg.inv(K2)
-    return H1, H2, disp_axis, cam_swapped, disp_coeff, roi1, roi2
+    return (H1, H2, disp_axis, cam_swapped, disp_coeff,
+            roi1, roi2, R1_rect, R2_rect, f_rect, cx_rect, cy_rect)
 
 
 def process_pair(
@@ -161,7 +153,7 @@ def process_pair(
     if result is None:
         logger.warning("Pair %d: calibrated rectification failed", pair_idx)
         return None
-    H1, H2, disp_axis, cam_swapped, disp_coeff, roi1, roi2 = result
+    H1, H2, disp_axis, cam_swapped, disp_coeff, roi1, roi2, R1_rect, R2_rect, f_rect, cx_rect, cy_rect = result
 
     # If cam2 is "left" of cam1 in rectified space, SGBM would need negative
     # disparity (minDisparity=0 blocks all valid matches).  Swap the pair so
@@ -172,6 +164,7 @@ def process_pair(
         cam1_s, cam2_s = cam2_s, cam1_s
         cam1, cam2 = cam2, cam1
         roi1, roi2 = roi2, roi1
+        R1_rect, R2_rect = R2_rect, R1_rect
         logger.debug("Pair %d: cameras swapped to ensure positive disparity", pair_idx)
 
     # Log ROI coverage so we can see how much of the rectified image is valid.
@@ -295,48 +288,28 @@ def process_pair(
         idx = np.random.choice(len(rows), max_pts, replace=False)
         rows, cols = rows[idx], cols[idx]
 
-    us = cols.astype(np.float32)
-    vs = rows.astype(np.float32)
-    ds = disp_full[rows, cols]
+    us = cols.astype(np.float64)
+    vs = rows.astype(np.float64)
+    ds = disp_full[rows, cols].astype(np.float64)
 
-    H1_inv = np.linalg.inv(H1).astype(np.float32)
-    H2_inv = np.linalg.inv(H2).astype(np.float32)
-    ones = np.ones(len(us), dtype=np.float32)
+    # ── Direct pinhole reprojection (avoids ill-conditioned H1_inv) ────────
+    # With CALIB_ZERO_DISPARITY, cx and cy are identical in both rectified
+    # cameras.  For horizontal stereo (disp_axis=0):
+    #   d = u1 - u2  →  Z = disp_coeff / d,  X = (u-cx)*Z/f,  Y = (v-cy)*Z/f
+    # For vertical stereo (disp_axis=1):
+    #   d = v1 - v2  →  same depth formula (disp_coeff uses |Ty| instead of |Tx|)
+    # Both cases reduce to Z = disp_coeff / d in the rectified cam1 frame.
+    # We then rotate back to world ENU via R1_rect and cam1's pose.
+    Z_rect = disp_coeff / ds                          # depth along rect. Z axis
+    X_rect = (us - cx_rect) * Z_rect / f_rect
+    Y_rect = (vs - cy_rect) * Z_rect / f_rect
 
-    # Back-project rect→original for image 1
-    pts_r1 = np.stack([us, vs, ones], axis=1)
-    pts_o1 = (H1_inv @ pts_r1.T).T
-    pts_o1 = pts_o1[:, :2] / pts_o1[:, 2:3]
+    pts_rect = np.stack([X_rect, Y_rect, Z_rect], axis=1)  # N×3 in rectified cam1 frame
 
-    # Back-project rect→original for image 2.
-    # Disparity shifts the X coordinate for horizontal stereo, Y for vertical.
-    if disp_axis == 0:
-        pts_r2 = np.stack([us - ds, vs, ones], axis=1)
-    else:
-        pts_r2 = np.stack([us, vs - ds, ones], axis=1)
-    pts_o2 = (H2_inv @ pts_r2.T).T
-    pts_o2 = pts_o2[:, :2] / pts_o2[:, 2:3]
-
-    # Triangulate (metric ENU via P1, P2)
-    # cam1.P / cam2.P are built with the original (full-res) K; we need to use
-    # the scaled K so projections are consistent with img_size coordinates.
-    from dataclasses import replace as _dc_replace
-    t1_col = cam1.t.reshape(3, 1)
-    t2_col = cam2.t.reshape(3, 1)
-    P1_use = cam1_s.K @ np.hstack([cam1.R, -cam1.R @ t1_col])
-    P2_use = cam2_s.K @ np.hstack([cam2.R, -cam2.R @ t2_col])
-
-    pts3d_h = cv2.triangulatePoints(
-        P1_use.astype(np.float64),
-        P2_use.astype(np.float64),
-        pts_o1.T.astype(np.float64),
-        pts_o2.T.astype(np.float64),
-    )
-    w_coord = pts3d_h[3]
-    nonzero = np.abs(w_coord) > 1e-8
-    pts3d = np.zeros((4, pts3d_h.shape[1]), dtype=np.float64)
-    pts3d[:, nonzero] = pts3d_h[:, nonzero] / w_coord[nonzero]
-    xyz = pts3d[:3].T  # N×3
+    # Rectified cam1 frame → cam1 original frame → world ENU
+    pts_cam1 = (R1_rect.T @ pts_rect.T).T            # undo rectification rotation
+    xyz = (cam1.R.T @ pts_cam1.T).T + cam1.t         # world ENU (N×3)
+    nonzero = np.ones(len(xyz), dtype=bool)           # all finite by construction
 
     # ------------------------------------------------------------------ #
     # 4. Filter outliers
