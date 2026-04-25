@@ -85,10 +85,19 @@ class Session:
             json.dump(summary, f, indent=2, ensure_ascii=False)
 
     @staticmethod
-    def load_from_path(path: str) -> tuple[list[Item], dict[str, np.ndarray]]:
+    def load_from_path(
+        path: str,
+        max_long_edge: int = 4000,
+    ) -> tuple[list[Item], dict[str, np.ndarray]]:
         """
         Load items and decoded images from an existing session folder.
         Returns (items, images) where images maps item_id → BGR ndarray.
+
+        max_long_edge: resize each image so its longest side is at most this
+        many pixels before storing it.  Defaults to 4000 (matching
+        TARGET_LONG_EDGE in camera.py) so the images dict never holds
+        full-resolution arrays, which can be hundreds of MB each.
+        Pass None to skip resizing (risks OOM for large datasets).
         """
         folder = Path(path)
         metadata_dir = folder / "metadata"
@@ -118,10 +127,21 @@ class Session:
                 img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
                 if img is not None and img.ndim == 2:
                     img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            del img_data, arr  # free compressed bytes immediately; decoded array is in img
+            del img_data, arr  # free compressed bytes; decoded array is in img
             if img is None:
                 logger.warning("Could not decode image %s", img_path)
                 continue
+
+            if max_long_edge is not None:
+                h, w = img.shape[:2]
+                long = max(h, w)
+                if long > max_long_edge:
+                    scale = max_long_edge / long
+                    img = cv2.resize(
+                        img,
+                        (int(round(w * scale)), int(round(h * scale))),
+                        interpolation=cv2.INTER_AREA,
+                    )
 
             items.append(item)
             images[item.id] = img
