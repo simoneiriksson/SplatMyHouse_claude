@@ -463,16 +463,15 @@ def process_pair(
         peak_idx = int(np.argmax(hist_counts))
         z_mode = float((hist_edges[peak_idx] + hist_edges[peak_idx + 1]) / 2)
 
-        # Sanity check: the mode should be below the cameras but not by more
-        # than ~2500 m.  If it's deeper, the pair matched noise (no real
-        # overlap) and should be rejected entirely.
-        cam_z = float(min(cam1.t[2], cam2.t[2]))
-        max_reasonable_depth = 2500.0  # metres — generous upper bound
-        if z_mode < cam_z - max_reasonable_depth:
+        # Sanity check: Z-mode must not be more than 200 m below the expected
+        # ground plane.  If it is, the histogram is dominated by noise matches
+        # (the pair has too little real overlap for SGBM to lock onto the
+        # ground) and the pair should be discarded entirely.
+        if z_mode < ground_z - 200.0:
             logger.warning(
-                "Pair %d: Z-mode=%.1f is %.0f m below cameras (cam_z=%.1f) "
-                "— likely noise-only pair, rejecting",
-                pair_idx, z_mode, cam_z - z_mode, cam_z,
+                "Pair %d: Z-mode=%.1f is %.0f m below ground_z=%.1f "
+                "— noise-dominated pair, rejecting",
+                pair_idx, z_mode, ground_z - z_mode, ground_z,
             )
             return None
 
