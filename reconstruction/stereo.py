@@ -100,21 +100,55 @@ def _calibrated_rectify(
             roi1, roi2, R1_rect, R2_rect, f_rect, cx_rect, cy_rect, rect_size)
 
 
-def _target_crop_window(
+def _scene_rect_window(
     K: np.ndarray,
     R: np.ndarray,
     t: np.ndarray,
     H: np.ndarray,
+    pts: np.ndarray,
+    rect_size: tuple[int, int],
+    margin_px: int,
+) -> Optional[tuple[int, int, int, int]]:
+    """Project scene points through one camera into rectified image; return bbox or None."""
+    P = K @ np.hstack([R, -(R @ t.reshape(3, 1))])
+    pts4 = np.hstack([pts, np.ones((len(pts), 1))])
+    uvw = (P @ pts4.T).T
+    in_front = uvw[:, 2] > 0
+    if in_front.sum() < 4:
+        return None
+    uv = uvw[in_front, :2] / uvw[in_front, 2:3]
+    uv3 = np.hstack([uv, np.ones((len(uv), 1))])
+    rh = (H @ uv3.T).T
+    uv_r = rh[:, :2] / rh[:, 2:3]
+    x0 = max(0, int(uv_r[:, 0].min()) - margin_px)
+    x1 = min(rect_size[0], int(uv_r[:, 0].max()) + margin_px)
+    y0 = max(0, int(uv_r[:, 1].min()) - margin_px)
+    y1 = min(rect_size[1], int(uv_r[:, 1].max()) + margin_px)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1, y1
+
+
+def _target_crop_window(
+    K1: np.ndarray, R1: np.ndarray, t1: np.ndarray, H1: np.ndarray,
+    K2: np.ndarray, R2: np.ndarray, t2: np.ndarray, H2: np.ndarray,
     scene_center: np.ndarray,
     scene_radius: float,
     ground_z: float,
     rect_size: tuple[int, int],
+    disp_axis: int = 0,
     margin_px: int = 100,
 ) -> Optional[tuple[int, int, int, int]]:
     """
-    Return (x0, y0, x1, y1) in rectified-image pixels that tightly covers the
-    scene cylinder (scene_center ± scene_radius, ground_z … ground_z+100 m).
-    Returns None when the window would cover ≥90 % of the image (no useful crop).
+    Return (x0, y0, x1, y1) covering the shared scene footprint in both
+    rectified images.
+
+    Along the disparity direction (x for horizontal, y for vertical stereo)
+    the two cameras see the scene at shifted positions — we take the UNION so
+    SGBM can search across the full shift.  Along the non-disparity direction
+    we take the INTERSECTION (rows/columns where both cameras see the scene).
+
+    Returns None when the combined window would cover ≥90% of the image.
     """
     cx, cy = float(scene_center[0]), float(scene_center[1])
     angles = np.linspace(0, 2 * np.pi, 24, endpoint=False)
@@ -125,22 +159,23 @@ def _target_crop_window(
                         cy + scene_radius * np.sin(a), z])
     pts = np.array(pts, dtype=np.float64)
 
-    P = K @ np.hstack([R, -(R @ t.reshape(3, 1))])
-    pts4 = np.hstack([pts, np.ones((len(pts), 1))])
-    uvw = (P @ pts4.T).T
-    in_front = uvw[:, 2] > 0
-    if in_front.sum() < 4:
+    win1 = _scene_rect_window(K1, R1, t1, H1, pts, rect_size, margin_px)
+    win2 = _scene_rect_window(K2, R2, t2, H2, pts, rect_size, margin_px)
+    if win1 is None or win2 is None:
         return None
-    uv = uvw[in_front, :2] / uvw[in_front, 2:3]
 
-    uv3 = np.hstack([uv, np.ones((len(uv), 1))])
-    rh = (H @ uv3.T).T
-    uv_r = rh[:, :2] / rh[:, 2:3]
+    x0_1, y0_1, x1_1, y1_1 = win1
+    x0_2, y0_2, x1_2, y1_2 = win2
 
-    x0 = max(0, int(uv_r[:, 0].min()) - margin_px)
-    x1 = min(rect_size[0], int(uv_r[:, 0].max()) + margin_px)
-    y0 = max(0, int(uv_r[:, 1].min()) - margin_px)
-    y1 = min(rect_size[1], int(uv_r[:, 1].max()) + margin_px)
+    if disp_axis == 0:
+        # Horizontal stereo: union in x (disparity direction), intersection in y
+        x0, x1 = min(x0_1, x0_2), max(x1_1, x1_2)
+        y0, y1 = max(y0_1, y0_2), min(y1_1, y1_2)
+    else:
+        # Vertical stereo: union in y (disparity direction), intersection in x
+        x0, x1 = max(x0_1, x0_2), min(x1_1, x1_2)
+        y0, y1 = min(y0_1, y0_2), max(y1_1, y1_2)
+
     if x1 <= x0 or y1 <= y0:
         return None
     if (x1 - x0) * (y1 - y0) >= 0.9 * rect_size[0] * rect_size[1]:
@@ -241,23 +276,20 @@ def process_pair(
         cv2.imwrite(str(debug_dir / f"debug_pair_{pair_idx:02d}_right.jpg"), rect2)
 
     # ── Target crop ───────────────────────────────────────────────────────
-    # Project the scene cylinder (scene_center ± scene_radius, ground_z …
-    # ground_z+100 m) through cam1's projection + H1 to find the bounding
-    # box in the rectified image that covers the target area.  SGBM only
-    # runs on this sub-image, which eliminates off-target matches (the main
-    # cause of south-camera "bands" outside the scene_radius crop).
+    # Project the scene cylinder through BOTH cameras into their rectified
+    # frames and compute a combined crop window:
+    #   - disparity direction (x for horizontal, y for vertical): UNION of
+    #     the two windows, so SGBM can search across the full disparity shift
+    #   - non-disparity direction: INTERSECTION, rows/cols both cameras see
     crop_x, crop_y = 0, 0
     active_w, active_h = rect_size[0], rect_size[1]
 
-    # Target crop: restrict SGBM to the scene cylinder projection.
-    # Skip for nadir-nadir pairs — they already look straight at the target
-    # and their full image overlap should be used.  Oblique cameras have wide
-    # footprints where most of the image is off-target, so the crop helps.
-    both_nadir = (cam1.direction == "nadir" and cam2.direction == "nadir")
-    if not both_nadir and scene_center is not None and scene_radius is not None:
+    if scene_center is not None and scene_radius is not None:
         win = _target_crop_window(
             cam1_s.K, cam1_s.R, cam1_s.t, H1,
+            cam2_s.K, cam2_s.R, cam2_s.t, H2,
             scene_center, scene_radius, ground_z, rect_size,
+            disp_axis=disp_axis,
         )
         if win is not None:
             x0, y0, x1, y1 = win
