@@ -168,13 +168,17 @@ def _target_crop_window(
     x0_2, y0_2, x1_2, y1_2 = win2
 
     if disp_axis == 0:
-        # Horizontal stereo: union in x (disparity direction), intersection in y
-        x0, x1 = min(x0_1, x0_2), max(x1_1, x1_2)
+        # Horizontal stereo: keep full x width, intersect y only.
+        # Cropping x (disparity direction) creates dead zones — the scene
+        # appears at shifted x positions in the two cameras, so one image
+        # has no real content on one side.  SGBM matches that dead zone
+        # against real content in the other image → wrong XY triangulation.
+        x0, x1 = 0, rect_size[0]
         y0, y1 = max(y0_1, y0_2), min(y1_1, y1_2)
     else:
-        # Vertical stereo: union in y (disparity direction), intersection in x
+        # Vertical stereo: keep full y height, intersect x only.
         x0, x1 = max(x0_1, x0_2), min(x1_1, x1_2)
-        y0, y1 = min(y0_1, y0_2), max(y1_1, y1_2)
+        y0, y1 = 0, rect_size[1]
 
     if x1 <= x0 or y1 <= y0:
         return None
