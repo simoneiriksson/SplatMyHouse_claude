@@ -316,8 +316,12 @@ def compute_pairs(
 
     # ── Diversity cap ─────────────────────────────────────────────────────────
     # Limit each direction combination (e.g. nadir↔north) to at most
-    # max_per_combo slots so nadir↔nadir pairs cannot flood the selection.
-    max_per_combo = max(2, max_pairs // 6)
+    # max_per_combo slots so no single combo floods the selection.
+    # Divide evenly across the combos that actually exist in candidates so
+    # that filtering to a single direction (e.g. nadir-only) still fills all
+    # max_pairs slots rather than being capped at 2 or 3.
+    n_combos = max(1, len({frozenset({p.cam_i.direction, p.cam_j.direction}) for p in candidates}))
+    max_per_combo = max(2, max_pairs // n_combos)
     combo_counts: dict[frozenset, int] = {}
     selected: list[Pair] = []
     for pair in candidates:
