@@ -302,6 +302,14 @@ def compute_pairs(
                 dist_to_target = float(np.linalg.norm(mid - np.array([cx, cy])))
                 coverage = float(np.exp(-0.5 * (dist_to_target / 500.0) ** 2))
 
+            if coverage < 0.05:
+                rejected.append(
+                    f"  [{cam_i.direction}/{cam_i.item_id[-8:]} ↔ "
+                    f"{cam_j.direction}/{cam_j.item_id[-8:]}] "
+                    f"scene_overlap={coverage:.3f} REJECTED (< 0.05)"
+                )
+                continue
+
             score = bs * db * coverage
             candidates.append(Pair(i=i, j=j, score=score, baseline=baseline,
                                    cam_i=cam_i, cam_j=cam_j))
