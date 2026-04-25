@@ -5,7 +5,7 @@ from typing import Optional
 import numpy as np
 
 from reconstruction.camera import Camera
-from reconstruction.pairs import compute_pairs
+from reconstruction.pairs import compute_pairs, _ground_footprint
 from reconstruction.stereo import process_pair
 from reconstruction.pointcloud import merge_pointclouds
 
@@ -80,10 +80,24 @@ def run(
     for idx, pair in enumerate(pairs):
         _cb("stereo", f"Pair {idx + 1}/{len(pairs)}: {pair.cam_i.direction} ↔ {pair.cam_j.direction}", idx, len(pairs))
         n_pts = 0
+        n_in_scene = 0
         ok = False
         view_xyz = view_rgb = None
+
+        # Footprint midpoint distance to scene centre — tells user where this pair looks
+        fp_dist: float | None = None
+        if scene_center is not None:
+            fp_i = _ground_footprint(pair.cam_i, ground_z=ground_z)
+            fp_j = _ground_footprint(pair.cam_j, ground_z=ground_z)
+            mid = (fp_i + fp_j) / 2.0
+            fp_dist = float(np.linalg.norm(mid - scene_center[:2]))
+
         try:
-            result = process_pair(pair.cam_i, pair.cam_j, debug_dir=debug_dir, pair_idx=idx, max_points=max_points)
+            result = process_pair(
+                pair.cam_i, pair.cam_j,
+                debug_dir=debug_dir, pair_idx=idx, max_points=max_points,
+                scene_center=scene_center, scene_radius=scene_radius, ground_z=ground_z,
+            )
             if result is not None:
                 xyz, rgb = result
                 n_pts = len(xyz)
@@ -92,14 +106,25 @@ def run(
                 points_before_merge += n_pts
                 processed += 1
                 ok = True
-                # Subsample for the viewer
-                if n_pts > _VIEW_MAX:
-                    sel = np.random.choice(n_pts, _VIEW_MAX, replace=False)
-                    view_xyz = xyz[sel]
-                    view_rgb = rgb[sel]
-                else:
-                    view_xyz = xyz.copy()
-                    view_rgb = rgb.copy()
+
+                # Subsample for the viewer — crop to scene_radius first so the
+                # per-pair viewer shows exactly what each pair contributes to the
+                # final PLY (not the full unclipped reconstruction).
+                xyz_v, rgb_v = xyz, rgb
+                if scene_center is not None and scene_radius is not None:
+                    xy_dist = np.linalg.norm(xyz[:, :2] - scene_center[:2], axis=1)
+                    in_r = xy_dist <= scene_radius
+                    xyz_v = xyz[in_r]
+                    rgb_v = rgb[in_r]
+                n_in_scene = len(xyz_v)
+
+                if n_in_scene > _VIEW_MAX:
+                    sel = np.random.choice(n_in_scene, _VIEW_MAX, replace=False)
+                    view_xyz = xyz_v[sel]
+                    view_rgb = rgb_v[sel]
+                elif n_in_scene > 0:
+                    view_xyz = xyz_v.copy()
+                    view_rgb = rgb_v.copy()
         except Exception as exc:
             logger.warning("Pair %d failed: %s", idx, exc, exc_info=True)
         pair_stats.append({
@@ -111,6 +136,8 @@ def run(
             "baseline": pair.baseline,
             "score": pair.score,
             "points": n_pts,
+            "points_in_scene": n_in_scene,
+            "fp_dist": fp_dist,
             "ok": ok,
         })
         pair_view_xyz.append(view_xyz)

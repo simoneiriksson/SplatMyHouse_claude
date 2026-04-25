@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # Match stereo.py constants — used for pre-screening pair disparity.
 _SGBM_LONG_EDGE = 800
-_MAX_SGBM_DISP = 512      # pairs with estimated disparity above this are skipped
+_MAX_SGBM_DISP = 608      # pairs with estimated disparity above this are skipped
 _ALTITUDE_AGL = 1300.0    # typical Skraafotos altitude above ground (m)
 
 
@@ -21,19 +21,18 @@ def _estimate_pair_disparity(cam_i: Camera, cam_j: Camera) -> float:
     Return the expected maximum SGBM-scale disparity for a pair using the
     actual stereoRectify output.  Returns inf if rectification fails.
 
-    This is called during pair selection to pre-screen pairs that SGBM
-    cannot process (disparity range exceeds image width).
+    stereoRectify can inflate f_rect by 2-3× for oblique cameras (it zooms
+    into the overlap region).  stereo.py compensates by re-running with a
+    smaller newImageSize when d_est is too large.  This function mirrors that
+    logic so pairs rejected here are actually unworkable, not just large.
 
     The minimum scene depth is derived from the camera tilt angle:
       - Nadir cameras (looking straight down): depth ≈ altitude AGL
       - Oblique cameras at angle θ from nadir: depth ≈ altitude / cos(θ)
-    This avoids falsely rejecting valid oblique pairs (e.g. same-direction
-    adjacent-strip pairs) whose stereo geometry is sound but whose disp_coeff
-    is large because the rectified focal length is large.
     """
     img_size = (
-        min(cam_i.image.shape[1], cam_j.image.shape[1]),
-        min(cam_i.image.shape[0], cam_j.image.shape[0]),
+        min(cam_i.img_size[0], cam_j.img_size[0]),
+        min(cam_i.img_size[1], cam_j.img_size[1]),
     )
     K1, K2 = cam_i.K, cam_j.K
     R1, R2 = cam_i.R, cam_j.R
@@ -55,8 +54,6 @@ def _estimate_pair_disparity(cam_i: Camera, cam_j: Camera) -> float:
     sgbm_scale = _SGBM_LONG_EDGE / max(img_size)
 
     # Minimum scene depth: altitude AGL / cos(tilt).
-    # cam.R[2,:] is the camera optical axis in world ENU; its z-component
-    # equals cos(tilt from vertical) since ENU z is Up.
     tilt_cos = abs((R1[2, 2] + R2[2, 2]) / 2.0)
     tilt_cos = max(tilt_cos, 0.3)   # clamp for nearly-horizontal cameras
     min_depth = _ALTITUDE_AGL / tilt_cos
@@ -178,6 +175,49 @@ def compute_pairs(
                 )
                 continue
 
+            # ── Perpendicular-baseline filter ──────────────────────────────────
+            # For oblique cameras, a baseline mostly parallel to the optical axis
+            # (along-track) causes cv2.stereoRectify to produce a rectified frame
+            # where the scene projects far outside the visible image window.
+            # SGBM then matches unrelated image content → garbage 3D points.
+            # Reject any pair where the baseline is > 60% along the average
+            # optical-axis direction; score the rest by the perpendicular component.
+            t_vec = cam_j.t - cam_i.t
+            opt_i = cam_i.R.T[:, 2]   # cam_i optical axis in world (OpenCV +Z into scene)
+            opt_j = cam_j.R.T[:, 2]
+            avg_opt = (opt_i + opt_j) / 2.0
+            avg_opt /= float(np.linalg.norm(avg_opt))
+            along_axis = abs(float(t_vec @ avg_opt))
+            perp_baseline = math.sqrt(max(0.0, baseline ** 2 - along_axis ** 2))
+            # For south/north cameras (45° tilt), a purely N-S baseline has
+            # perp_fraction = cos(45°) = 0.707 which is along-track and produces
+            # degenerate rectification.  A purely E-W baseline gives perp=1.0 (ideal).
+            # Threshold 0.8 rejects along-track oblique pairs while accepting cross-track
+            # pairs and all nadir pairs (which always have perp_fraction ≈ 1.0).
+            if perp_baseline < 0.8 * baseline:
+                rejected.append(
+                    f"  [{cam_i.direction}/{cam_i.item_id[-8:]} ↔ "
+                    f"{cam_j.direction}/{cam_j.item_id[-8:]}] "
+                    f"perp_baseline={perp_baseline:.0f}m ({100*perp_baseline/baseline:.0f}% of {baseline:.0f}m) "
+                    f"REJECTED (along-track pair)"
+                )
+                continue
+
+            # ── Altitude-difference filter ─────────────────────────────────────
+            # Pairs where one camera is much higher/lower than the other produce
+            # degenerate rectification: the scene falls outside one camera's image
+            # even though both cameras look in the same direction.  Reject if the
+            # altitude difference exceeds 40% of the total baseline.
+            dz = abs(float(cam_j.t[2] - cam_i.t[2]))
+            if dz > 0.4 * baseline:
+                rejected.append(
+                    f"  [{cam_i.direction}/{cam_i.item_id[-8:]} ↔ "
+                    f"{cam_j.direction}/{cam_j.item_id[-8:]}] "
+                    f"dz={dz:.0f}m ({100*dz/baseline:.0f}% of {baseline:.0f}m) "
+                    f"REJECTED (altitude mismatch)"
+                )
+                continue
+
             # SGBM disparity pre-screen using actual stereoRectify output.
             # Pairs whose disparity range exceeds SGBM's practical limit only
             # produce noise and waste compute time — skip them early.
@@ -190,7 +230,9 @@ def compute_pairs(
                 )
                 continue
 
-            bs = _baseline_score(baseline, min_baseline, max_baseline)
+            # Score by the perpendicular (geometrically effective) baseline.
+            # This prefers pairs with good depth sensitivity over along-track pairs.
+            bs = _baseline_score(perp_baseline, min_baseline, max_baseline)
             db = _direction_bonus(cam_i.direction, cam_j.direction)
 
             # Proximity bonus: prefer pairs whose ground footprints are near target.

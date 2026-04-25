@@ -23,7 +23,7 @@ def _calibrated_rectify(
     cam1: Camera,
     cam2: Camera,
     img_size: tuple[int, int],
-) -> Optional[tuple[np.ndarray, np.ndarray, int, bool, float]]:
+) -> Optional[tuple]:
     """
     Compute rectification homographies from known camera geometry.
 
@@ -31,12 +31,15 @@ def _calibrated_rectify(
     uncalibrated version for nadir pairs where feature matches can be
     degenerate (collinear).
 
-    Returns (H1, H2, disp_axis) where:
-      - H1, H2 map ORIGINAL → RECTIFIED pixel coordinates (same convention
-        as stereoRectifyUncalibrated, suitable for cv2.warpPerspective)
-      - disp_axis: 0 = horizontal stereo (disparity in X), 1 = vertical
-        stereo (disparity in Y) — occurs when the baseline is mostly N-S
-        and nadir cameras are used
+    Returns a 13-element tuple:
+      (H1, H2, disp_axis, cam_swapped, disp_coeff,
+       roi1, roi2, R1_rect, R2_rect, f_rect, cx_rect, cy_rect, rect_size)
+
+    where:
+      - H1, H2 map ORIGINAL-image pixels → RECTIFIED-image (rect_size) pixels
+      - rect_size: (W, H) of the rectified images (may differ from img_size when
+        stereoRectify down-scales to control disparity range)
+      - disp_axis: 0 = horizontal stereo, 1 = vertical stereo
     Returns None on failure.
     """
     K1, R1, t1 = cam1.K, cam1.R, cam1.t
@@ -47,18 +50,18 @@ def _calibrated_rectify(
     t_rel = (R2 @ (t1 - t2)).reshape(3, 1)
 
     dist_zeros = np.zeros(5)
+
     try:
         R1_rect, R2_rect, P1_rect, P2_rect, _Q, roi1, roi2 = cv2.stereoRectify(
-            K1, dist_zeros,
-            K2, dist_zeros,
-            img_size,
-            R_rel, t_rel,
-            flags=cv2.CALIB_ZERO_DISPARITY,
-            alpha=0,
+            K1, dist_zeros, K2, dist_zeros,
+            img_size, R_rel, t_rel,
+            flags=cv2.CALIB_ZERO_DISPARITY, alpha=0,
         )
     except cv2.error as exc:
         logger.warning("stereoRectify failed: %s", exc)
         return None
+
+    rect_size = img_size
 
     # New (rectified) intrinsic matrix from the projection matrix
     K1_new = P1_rect[:3, :3]
@@ -94,7 +97,55 @@ def _calibrated_rectify(
     H1 = K1_new @ R1_rect @ np.linalg.inv(K1)
     H2 = K2_new @ R2_rect @ np.linalg.inv(K2)
     return (H1, H2, disp_axis, cam_swapped, disp_coeff,
-            roi1, roi2, R1_rect, R2_rect, f_rect, cx_rect, cy_rect)
+            roi1, roi2, R1_rect, R2_rect, f_rect, cx_rect, cy_rect, rect_size)
+
+
+def _target_crop_window(
+    K: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    H: np.ndarray,
+    scene_center: np.ndarray,
+    scene_radius: float,
+    ground_z: float,
+    rect_size: tuple[int, int],
+    margin_px: int = 100,
+) -> Optional[tuple[int, int, int, int]]:
+    """
+    Return (x0, y0, x1, y1) in rectified-image pixels that tightly covers the
+    scene cylinder (scene_center ± scene_radius, ground_z … ground_z+100 m).
+    Returns None when the window would cover ≥90 % of the image (no useful crop).
+    """
+    cx, cy = float(scene_center[0]), float(scene_center[1])
+    angles = np.linspace(0, 2 * np.pi, 24, endpoint=False)
+    pts = []
+    for z in [ground_z, ground_z + 50.0, ground_z + 100.0]:
+        for a in angles:
+            pts.append([cx + scene_radius * np.cos(a),
+                        cy + scene_radius * np.sin(a), z])
+    pts = np.array(pts, dtype=np.float64)
+
+    P = K @ np.hstack([R, -(R @ t.reshape(3, 1))])
+    pts4 = np.hstack([pts, np.ones((len(pts), 1))])
+    uvw = (P @ pts4.T).T
+    in_front = uvw[:, 2] > 0
+    if in_front.sum() < 4:
+        return None
+    uv = uvw[in_front, :2] / uvw[in_front, 2:3]
+
+    uv3 = np.hstack([uv, np.ones((len(uv), 1))])
+    rh = (H @ uv3.T).T
+    uv_r = rh[:, :2] / rh[:, 2:3]
+
+    x0 = max(0, int(uv_r[:, 0].min()) - margin_px)
+    x1 = min(rect_size[0], int(uv_r[:, 0].max()) + margin_px)
+    y0 = max(0, int(uv_r[:, 1].min()) - margin_px)
+    y1 = min(rect_size[1], int(uv_r[:, 1].max()) + margin_px)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    if (x1 - x0) * (y1 - y0) >= 0.9 * rect_size[0] * rect_size[1]:
+        return None
+    return x0, y0, x1, y1
 
 
 def process_pair(
@@ -103,6 +154,9 @@ def process_pair(
     debug_dir: Optional[Path] = None,
     pair_idx: int = 0,
     max_points: int = 100_000,
+    scene_center: "np.ndarray | None" = None,
+    scene_radius: "float | None" = None,
+    ground_z: float = -1300.0,
 ) -> Optional[tuple[np.ndarray, np.ndarray]]:
     """
     Stereo reconstruct one camera pair.
@@ -153,7 +207,7 @@ def process_pair(
     if result is None:
         logger.warning("Pair %d: calibrated rectification failed", pair_idx)
         return None
-    H1, H2, disp_axis, cam_swapped, disp_coeff, roi1, roi2, R1_rect, R2_rect, f_rect, cx_rect, cy_rect = result
+    H1, H2, disp_axis, cam_swapped, disp_coeff, roi1, roi2, R1_rect, R2_rect, f_rect, cx_rect, cy_rect, rect_size = result
 
     # If cam2 is "left" of cam1 in rectified space, SGBM would need negative
     # disparity (minDisparity=0 blocks all valid matches).  Swap the pair so
@@ -172,16 +226,46 @@ def process_pair(
     # valid region can be a small fraction of the full image.
     def _roi_frac(roi):
         _, _, w, h = roi
-        return w * h / (img_size[0] * img_size[1])
+        return w * h / (rect_size[0] * rect_size[1])
     logger.info("Pair %d: rectified ROI coverage cam1=%.0f%% cam2=%.0f%%",
                 pair_idx, _roi_frac(roi1) * 100, _roi_frac(roi2) * 100)
 
-    rect1 = cv2.warpPerspective(img1_use, H1, img_size)
-    rect2 = cv2.warpPerspective(img2_use, H2, img_size)
+
+    # Warp to rect_size (which may be smaller than img_size when stereoRectify
+    # down-scaled to control disparity range).
+    rect1 = cv2.warpPerspective(img1_use, H1, rect_size)
+    rect2 = cv2.warpPerspective(img2_use, H2, rect_size)
 
     if debug_dir is not None:
         cv2.imwrite(str(debug_dir / f"debug_pair_{pair_idx:02d}_left.jpg"), rect1)
         cv2.imwrite(str(debug_dir / f"debug_pair_{pair_idx:02d}_right.jpg"), rect2)
+
+    # ── Target crop ───────────────────────────────────────────────────────
+    # Project the scene cylinder (scene_center ± scene_radius, ground_z …
+    # ground_z+100 m) through cam1's projection + H1 to find the bounding
+    # box in the rectified image that covers the target area.  SGBM only
+    # runs on this sub-image, which eliminates off-target matches (the main
+    # cause of south-camera "bands" outside the scene_radius crop).
+    crop_x, crop_y = 0, 0
+    active_w, active_h = rect_size[0], rect_size[1]
+
+    if scene_center is not None and scene_radius is not None:
+        win = _target_crop_window(
+            cam1_s.K, cam1_s.R, cam1_s.t, H1,
+            scene_center, scene_radius, ground_z, rect_size,
+        )
+        if win is not None:
+            x0, y0, x1, y1 = win
+            rect1 = rect1[y0:y1, x0:x1]
+            rect2 = rect2[y0:y1, x0:x1]
+            crop_x, crop_y = x0, y0
+            active_w, active_h = x1 - x0, y1 - y0
+            logger.info(
+                "Pair %d: target crop → %dx%d (%.0f%% of %dx%d)",
+                pair_idx, active_w, active_h,
+                100.0 * active_w * active_h / (rect_size[0] * rect_size[1]),
+                rect_size[0], rect_size[1],
+            )
 
     # ------------------------------------------------------------------ #
     # 2. SGBM at reduced scale (SGBM_LONG_EDGE)
@@ -191,10 +275,10 @@ def process_pair(
     # in Y).  We handle this by transposing both rectified images so the Y
     # baseline maps to the X direction, then running SGBM normally.
     # ------------------------------------------------------------------ #
-    max_rect_edge = max(img_size)
+    max_rect_edge = max(rect_size)
     sgbm_scale = SGBM_LONG_EDGE / max_rect_edge
-    sgbm_w = max(1, int(round(img_size[0] * sgbm_scale)))
-    sgbm_h = max(1, int(round(img_size[1] * sgbm_scale)))
+    sgbm_w = max(1, int(round(active_w * sgbm_scale)))
+    sgbm_h = max(1, int(round(active_h * sgbm_scale)))
     sgbm_size = (sgbm_w, sgbm_h)
 
     rect1_s = cv2.resize(rect1, sgbm_size, interpolation=cv2.INTER_AREA)
@@ -217,7 +301,7 @@ def process_pair(
     tilt_cos = abs((cam1.R[2, 2] + cam2.R[2, 2]) / 2.0)
     tilt_cos = max(tilt_cos, 0.3)
     MIN_DEPTH_M = 1300.0 / tilt_cos
-    MAX_NUM_DISP = 512   # cap; beyond this SGBM is unreliable/slow
+    MAX_NUM_DISP = 608   # cap; beyond this SGBM is unreliable/slow
     d_expected_sgbm = disp_coeff * sgbm_scale / MIN_DEPTH_M
     if d_expected_sgbm > MAX_NUM_DISP:
         logger.warning(
@@ -247,7 +331,7 @@ def process_pair(
     # we need to un-transpose back to H×W (but keeping the disp values).
     if disp_axis == 1:
         disp_small = disp_small.T   # back to H×W
-    disp_full = cv2.resize(disp_small, img_size,
+    disp_full = cv2.resize(disp_small, (active_w, active_h),
                            interpolation=cv2.INTER_LINEAR) / sgbm_scale
 
     if debug_dir is not None:
@@ -263,13 +347,15 @@ def process_pair(
     # can be large.  SGBM matches black-on-black regions, producing spurious
     # small-positive disparities that triangulate to garbage positions.
     # Masking to the ROI intersection eliminates these false matches.
-    H_px, W_px = img_size[1], img_size[0]
+    H_px, W_px = active_h, active_w
     roi_mask = np.zeros((H_px, W_px), dtype=bool)
     x1, y1, w1, h1 = roi1
     x2, y2, w2, h2 = roi2
-    # Intersection of both valid regions
-    ix = max(x1, x2);  iy = max(y1, y2)
-    ix2 = min(x1 + w1, x2 + w2);  iy2 = min(y1 + h1, y2 + h2)
+    # Intersection of both valid regions, shifted by crop offset
+    ix = max(x1, x2) - crop_x;  iy = max(y1, y2) - crop_y
+    ix2 = min(x1 + w1, x2 + w2) - crop_x;  iy2 = min(y1 + h1, y2 + h2) - crop_y
+    ix = max(0, ix);  iy = max(0, iy)
+    ix2 = min(active_w, ix2);  iy2 = min(active_h, iy2)
     if ix2 > ix and iy2 > iy:
         roi_mask[iy:iy2, ix:ix2] = True
     overlap_frac = roi_mask.sum() / roi_mask.size
@@ -288,8 +374,8 @@ def process_pair(
         idx = np.random.choice(len(rows), max_pts, replace=False)
         rows, cols = rows[idx], cols[idx]
 
-    us = cols.astype(np.float64)
-    vs = rows.astype(np.float64)
+    us = cols.astype(np.float64) + crop_x
+    vs = rows.astype(np.float64) + crop_y
     ds = disp_full[rows, cols].astype(np.float64)
 
     # ── Direct pinhole reprojection (avoids ill-conditioned H1_inv) ────────

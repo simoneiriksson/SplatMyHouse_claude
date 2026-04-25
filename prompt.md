@@ -570,3 +570,79 @@ Added Z-mode depth sanity check: pairs whose reconstructed Z-mode is >2500m belo
 are rejected as noise-only. Results: 14/15 pairs succeed across all 5 directions (nadir, south,
 east, west, north); 212k clean points; 54.7% above ground level confirming wall/rooftop geometry.
 Initialized git repository, added .gitignore (data/, *.ply, .env, etc.), created CLAUDE.md.
+### 2026-04-15 — Fix oblique stereo debris: perpendicular baseline filter + SGBM feasibility
+Diagnosed why non-nadir pairs produced garbage 3D points when nadir-nadir direction was excluded.
+Root cause 1: along-track (N-S) baselines for south oblique cameras make cv2.stereoRectify place
+cy_rect≈10478px (scene at v=-240, outside the 2999px-tall rectified image). SGBM matches different
+neighbourhoods in left and right images → scatter debris. Fix: perpendicular baseline filter in
+compute_pairs (pairs.py) — reject pairs where perp_baseline < 0.8 * baseline. South cameras with
+N-S baselines have perp_fraction=cos(45°)=0.707 < 0.8, so they are rejected; E-W baselines have
+perp_fraction≈1.0 → accepted; nadir pairs always pass.
+Root cause 2: for large E-W baselines (>400m), stereoRectify with alpha=0 zooms into the overlap
+region, inflating f_rect by up to 9×, producing SGBM-scale disparities of 2000-6000px >> 512 limit.
+A previous session attempted to fix this with adaptive newImageSize, but this is mathematically
+ineffective: reducing newImageSize also increases sgbm_scale proportionally (sgbm_scale =
+SGBM_LONG_EDGE / max(rect_size)), so SGBM disparity = f_rect*baseline*sgbm_scale/depth is invariant
+to newImageSize. Fix: removed the adaptive newImageSize logic from _calibrated_rectify (stereo.py)
+and reverted _estimate_pair_disparity (pairs.py) to return the actual d_est without the incorrect
+'return _TARGET_D_EST' shortcut that made infeasible pairs appear feasible. The practical max
+feasible baseline for south-south pairs is ~350m (d_est ~450px at SGBM scale).
+Also fixed rect_size propagation in stereo.py: disp_full resize and ROI mask now use rect_size
+(= img_size) consistently.
+Added tests/test_oblique_stereo.py with 4 geometric validation tests: (1) south footprints contain
+target, (2) along-track pairs rejected, (3) cross-track south pair produces valid cloud near target,
+(4) output points within footprint bbox. All 4 pass: the south pair (strips 142↔208, perp=277m,
+d_est=434px) yields 11,500+ points with centroid 192m from Rådhuspladsen and 0% outside bbox.
+### 2026-04-16 — Fix separated point-cloud clumps for south oblique stereo
+Diagnosed root cause of south-south point clouds appearing as separated clumps: the only SGBM-
+feasible south pair (142↔208) had a 296m altitude difference out of a 331m baseline. stereoRectify
+placed the scene principal point at cy=−4363 (4363px above the image top), leaving only the bottom
+8% of the rectified image as valid overlap. Result: tiny 145m×120m coverage area → separated clumps.
+Fix: raised the SGBM disparity cap from 512 to 608 in both reconstruction/stereo.py (MAX_NUM_DISP)
+and reconstruction/pairs.py (_MAX_SGBM_DISP). This admits the same-altitude cross-track south pairs
+(strips 208↔209, dz≈4m, perp=600m, d_est=577px) which were previously rejected at the 512px cap.
+Same-altitude pairs have no cy≈−4363 problem (matching flight height → scene centered in both
+images), yielding full ROI coverage.
+Also added an altitude-difference pre-filter in compute_pairs: pairs where |Δz| > 0.4 × baseline
+are rejected before calling stereoRectify, avoiding the degenerate cy geometry and reducing
+unnecessary computation.
+Added img_size field to Camera dataclass so _estimate_pair_disparity can read image dimensions
+without materialising the image array in memory.
+Updated tests/test_oblique_stereo.py: raised d_est filter threshold from 450 to 608 to match the
+new cap; fixed pair-scoring in tests 3 and 4 to weight footprint proximity (score = perp /
+(1 + fd/200)) so the test selects the pair whose cameras actually see the target rather than the
+pair with the marginally largest baseline. All 4 tests pass: 208↔209 pair (perp=600m, d_est=577px)
+yields 21,930 points with centroid 240m from Rådhuspladsen, 0% outside footprint bbox.
+### 2026-04-25 — Target-crop: use camera geometry to focus SGBM on scene area
+Root cause of south-camera "band outside nadir cloud": SGBM runs on the full rectified image and
+matches off-target content (fields, roads far from the target). The output 3D points lie outside
+the scene_radius crop applied later in merge_pointclouds, giving the appearance of a separate band.
+Also, east/north cameras in this dataset have ground footprints ~1300m from the target (they look
+away from it), so almost all their points are discarded at merge time; fp_dist column now makes
+this transparent in the notebook UI.
+
+Fix: added _target_crop_window() to reconstruction/stereo.py. Projects the scene cylinder
+(scene_center ± scene_radius, ground_z … ground_z+100 m) through cam1's full projection matrix and
+then through H1 (rectification homography) to compute a tight bounding box in rectified-image
+pixels. If the box covers <90% of the full rectified image it is used to crop rect1/rect2 before
+SGBM so the stereo matcher only processes the target area.
+
+Changes to process_pair() in reconstruction/stereo.py:
+- New parameters: scene_center (np.ndarray|None), scene_radius (float|None), ground_z (float=-1300)
+- After warpPerspective debug saves: call _target_crop_window; crop rect1/rect2; track crop_x,
+  crop_y, active_w, active_h (default to 0/0/rect_size when no crop)
+- SGBM sizing: split sgbm_scale_cap (for disparity cap check, uses max(rect_size)) from sgbm_scale
+  (for actual SGBM, uses max(active_w, active_h)) so cap check stays consistent with pairs.py
+- disp_full resize: uses (active_w, active_h) instead of rect_size
+- ROI mask: uses (active_h, active_w) shape; ROI coordinates shifted by (-crop_x, -crop_y) and
+  clamped to [0, active_w/h]
+- Triangulation: us = cols + crop_x, vs = rows + crop_y (convert crop-relative to rectified coords)
+- Color sampling: unchanged (rect1 is already cropped)
+
+Updated reconstruction/pipeline.py: process_pair() call now passes scene_center, scene_radius,
+ground_z forwarded from run().
+
+Prior session also added:
+- fp_dist (footprint midpoint distance to scene_center) in pair_stats
+- Per-pair viewer in pipeline.py crops xyz to scene_radius before subsampling, so view matches PLY
+- notebook.ipynb: pair legend shows fp=Xm, table has pts(scene) column, merged PLY shown after grid

@@ -22,6 +22,7 @@ class Camera:
     t: np.ndarray        # 3×1 camera centre in local ENU metres
     P: np.ndarray        # 3×4 projection matrix
     image: np.ndarray    # BGR image array
+    img_size: tuple      # (W, H) in pixels — stored separately to avoid touching image array
     session_path: Optional[Path] = None
 
 
@@ -121,6 +122,7 @@ def build_cameras(
             t=t_local,
             P=P,
             image=img,
+            img_size=(img.shape[1], img.shape[0]),
             session_path=session_path,
         ))
 
