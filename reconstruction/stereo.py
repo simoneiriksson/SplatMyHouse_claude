@@ -288,7 +288,8 @@ def process_pair(
     crop_x, crop_y = 0, 0
     active_w, active_h = rect_size[0], rect_size[1]
 
-    if scene_center is not None and scene_radius is not None:
+    both_nadir = (cam1.direction == "nadir" and cam2.direction == "nadir")
+    if not both_nadir and scene_center is not None and scene_radius is not None:
         win = _target_crop_window(
             cam1_s.K, cam1_s.R, cam1_s.t, H1,
             cam2_s.K, cam2_s.R, cam2_s.t, H2,
