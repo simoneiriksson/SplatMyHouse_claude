@@ -56,14 +56,16 @@ def build_cameras(
     images: dict[str, "np.ndarray"],
     session_folder: Optional[Path] = None,
 ) -> tuple[list[Camera], np.ndarray]:
-    """Returns (cameras, origin_utm) where origin_utm is the mean camera
-    position in UTM EPSG:25832 [E, N, h] used as the local ENU origin."""
     """
     Build Camera objects for all items that have matching images.
     Camera positions (pers:perspective_center) are in UTM EPSG:25832 [E, N, h].
     We convert to a local ENU frame by subtracting the mean camera position.
+
+    NOTE: clears the `images` dict on return to free full-resolution arrays.
+    Each Camera stores its own (resized) copy; the originals are not needed.
     """
     import cv2
+    import gc
 
     # Filter to items with available images
     valid = [(item, images[item.id]) for item in items if item.id in images]
@@ -93,18 +95,21 @@ def build_cameras(
         _flip = np.diag([1.0, -1.0, -1.0])
         R = _flip @ R_c2w.T   # world→camera (OpenCV convention)
 
-        # Resize image to TARGET_LONG_EDGE for speed
-        if TARGET_LONG_EDGE is not None:
-            h_img, w_img = img.shape[:2]
-            long_edge = max(h_img, w_img)
-            if long_edge > TARGET_LONG_EDGE:
-                scale = TARGET_LONG_EDGE / long_edge
-                new_w = int(round(w_img * scale))
-                new_h = int(round(h_img * scale))
-                img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                K = K.copy()
-                K[0, :] *= scale   # fx, cx
-                K[1, :] *= scale   # fy, cy
+        # Resize image to TARGET_LONG_EDGE for speed.
+        # Scale K from full sensor dimensions to final image dimensions so that
+        # the result is correct whether or not the image was pre-resized by the
+        # caller (e.g. Session.load_from_path already applied a resize).
+        w_full, h_full = item.interior.sensor_array_dimensions
+        h_img, w_img = img.shape[:2]
+        if TARGET_LONG_EDGE is not None and max(h_img, w_img) > TARGET_LONG_EDGE:
+            scale = TARGET_LONG_EDGE / max(h_img, w_img)
+            new_w = int(round(w_img * scale))
+            new_h = int(round(h_img * scale))
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            h_img, w_img = new_h, new_w
+        K = K.copy()
+        K[0, :] *= w_img / w_full
+        K[1, :] *= h_img / h_full
 
         # Projection matrix P = K @ [R | -R@t]
         t_col = t_local.reshape(3, 1)
@@ -127,4 +132,11 @@ def build_cameras(
         ))
 
     logger.info("Built %d cameras", len(cameras))
+
+    # Free original full-resolution arrays.  Cameras hold their own resized
+    # copies; the `images` dict is no longer needed and can be large (hundreds
+    # of MB per image at full sensor resolution).
+    images.clear()
+    gc.collect()
+
     return cameras, origin_utm

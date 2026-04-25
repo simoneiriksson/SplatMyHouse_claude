@@ -118,6 +118,7 @@ class Session:
                 img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
                 if img is not None and img.ndim == 2:
                     img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            del img_data, arr  # free compressed bytes immediately; decoded array is in img
             if img is None:
                 logger.warning("Could not decode image %s", img_path)
                 continue

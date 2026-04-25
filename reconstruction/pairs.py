@@ -93,6 +93,48 @@ class Pair:
     cam_j: Camera
 
 
+def _scene_overlap_fraction(
+    cam_i: Camera,
+    cam_j: Camera,
+    scene_center: np.ndarray,
+    scene_radius: float,
+    ground_z: float,
+    n_ring: int = 4,
+    n_angle: int = 20,
+) -> float:
+    """
+    Fraction of uniformly sampled scene-circle points (at ground_z) that project
+    inside both cameras' image boundaries.  Returns a value in [0, 1].
+
+    This is a better pair-selection signal than footprint-midpoint proximity:
+    same-strip nadir pairs (along-track baseline) share only a strip of the
+    scene circle, while cross-strip pairs (cross-track baseline) cover a
+    2-D patch — and score higher here.
+    """
+    cx, cy = float(scene_center[0]), float(scene_center[1])
+    radii = np.linspace(scene_radius / n_ring, scene_radius, n_ring)
+    angles = np.linspace(0, 2 * np.pi, n_angle, endpoint=False)
+    pts: list = [[cx + r * np.cos(a), cy + r * np.sin(a), float(ground_z)]
+                 for r in radii for a in angles]
+    pts.append([cx, cy, float(ground_z)])
+    pts_arr = np.array(pts, dtype=np.float64)
+    pts4 = np.hstack([pts_arr, np.ones((len(pts_arr), 1))])
+
+    def _in_image(cam: Camera) -> np.ndarray:
+        P = cam.K @ np.hstack([cam.R, -(cam.R @ cam.t.reshape(3, 1))])
+        uvw = (P @ pts4.T).T
+        in_front = uvw[:, 2] > 0
+        uv = np.full((len(pts_arr), 2), -1.0)
+        uv[in_front] = uvw[in_front, :2] / uvw[in_front, 2:3]
+        W, H = float(cam.img_size[0]), float(cam.img_size[1])
+        return (in_front
+                & (uv[:, 0] >= 0) & (uv[:, 0] <= W)
+                & (uv[:, 1] >= 0) & (uv[:, 1] <= H))
+
+    both = _in_image(cam_i) & _in_image(cam_j)
+    return float(both.sum()) / len(pts_arr)
+
+
 def _ground_footprint(cam: Camera, ground_z: float = -1000.0) -> np.ndarray:
     """
     Compute the approximate ground intersection of the camera's principal ray.
@@ -235,25 +277,31 @@ def compute_pairs(
             bs = _baseline_score(perp_baseline, min_baseline, max_baseline)
             db = _direction_bonus(cam_i.direction, cam_j.direction)
 
-            # Proximity bonus: prefer pairs whose ground footprints are near target.
-            # Uses the corrected ground plane so oblique cameras are scored by
-            # where they actually look, not where they are positioned.
-            prox = 1.0
-            if scene_center is not None:
+            # Scene-coverage score: fraction of the scene circle visible in both
+            # cameras.  This prefers cross-strip pairs (2-D patch coverage) over
+            # same-strip pairs (narrow along-track strip) and naturally handles
+            # proximity — cameras that don't see the target score near zero.
+            # Falls back to footprint-midpoint proximity when scene_radius is absent.
+            coverage = 1.0
+            if scene_center is not None and scene_radius is not None:
+                coverage = _scene_overlap_fraction(
+                    cam_i, cam_j, scene_center, scene_radius, ground_z,
+                )
+                logger.debug(
+                    "  %s/%s ↔ %s/%s  scene_overlap=%.2f",
+                    cam_i.direction, cam_i.item_id[-8:],
+                    cam_j.direction, cam_j.item_id[-8:],
+                    coverage,
+                )
+            elif scene_center is not None:
                 fp_i = _ground_footprint(cam_i, ground_z=ground_z)
                 fp_j = _ground_footprint(cam_j, ground_z=ground_z)
                 mid = (fp_i + fp_j) / 2.0
                 cx, cy = float(scene_center[0]), float(scene_center[1])
                 dist_to_target = float(np.linalg.norm(mid - np.array([cx, cy])))
-                prox = float(np.exp(-0.5 * (dist_to_target / 500.0) ** 2))
-                logger.debug(
-                    "  %s/%s ↔ %s/%s  footprint_mid=(%.0f,%.0f) dist=%.0fm prox=%.2f",
-                    cam_i.direction, cam_i.item_id[-8:],
-                    cam_j.direction, cam_j.item_id[-8:],
-                    mid[0], mid[1], dist_to_target, prox,
-                )
+                coverage = float(np.exp(-0.5 * (dist_to_target / 500.0) ** 2))
 
-            score = bs * db * prox
+            score = bs * db * coverage
             candidates.append(Pair(i=i, j=j, score=score, baseline=baseline,
                                    cam_i=cam_i, cam_j=cam_j))
 

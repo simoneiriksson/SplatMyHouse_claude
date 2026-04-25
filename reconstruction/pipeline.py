@@ -1,8 +1,19 @@
+import gc
 import logging
+import resource
+import sys
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+
+def _rss_gb() -> float:
+    """Current resident set size of this process in GB."""
+    ru = resource.getrusage(resource.RUSAGE_SELF)
+    # macOS reports ru_maxrss in bytes; Linux in kibibytes
+    factor = 1 if sys.platform == "darwin" else 1024
+    return ru.ru_maxrss * factor / 2 ** 30
 
 from reconstruction.camera import Camera
 from reconstruction.pairs import compute_pairs, _ground_footprint
@@ -24,6 +35,7 @@ def run(
     max_points: int = 100_000,
     progress_callback=None,
     ground_z: float = -1000.0,
+    memory_limit_gb: float = 40.0,
 ) -> tuple["open3d.geometry.PointCloud", dict]:  # type: ignore[name-defined]
     """
     Orchestrate the full reconstruction pipeline.
@@ -78,6 +90,16 @@ def run(
     pair_view_rgb: list[np.ndarray] = []
 
     for idx, pair in enumerate(pairs):
+        rss = _rss_gb()
+        if rss > memory_limit_gb:
+            logger.error(
+                "Memory limit reached: %.1f GB > %.1f GB — stopping after %d pairs",
+                rss, memory_limit_gb, idx,
+            )
+            _cb("stereo", f"Memory limit {memory_limit_gb:.0f} GB reached — stopping early", idx, len(pairs))
+            break
+        if idx % 3 == 0:
+            gc.collect()
         _cb("stereo", f"Pair {idx + 1}/{len(pairs)}: {pair.cam_i.direction} ↔ {pair.cam_j.direction}", idx, len(pairs))
         n_pts = 0
         n_in_scene = 0
