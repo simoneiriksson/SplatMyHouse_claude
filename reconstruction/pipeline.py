@@ -65,6 +65,7 @@ def run(
         max_pairs=max_pairs,
         debug=debug,
         scene_center=scene_center,
+        scene_radius=scene_radius,
         ground_z=ground_z,
     )
     _cb("pairs", f"{len(pairs)} pairs selected", 1, 1)

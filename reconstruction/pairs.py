@@ -165,6 +165,7 @@ def compute_pairs(
     max_pairs: int,
     debug: bool = False,
     scene_center: "np.ndarray | None" = None,
+    scene_radius: "float | None" = None,
     ground_z: float = -1000.0,
 ) -> list[Pair]:
     """
