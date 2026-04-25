@@ -249,7 +249,12 @@ def process_pair(
     crop_x, crop_y = 0, 0
     active_w, active_h = rect_size[0], rect_size[1]
 
-    if scene_center is not None and scene_radius is not None:
+    # Target crop: restrict SGBM to the scene cylinder projection.
+    # Skip for nadir-nadir pairs — they already look straight at the target
+    # and their full image overlap should be used.  Oblique cameras have wide
+    # footprints where most of the image is off-target, so the crop helps.
+    both_nadir = (cam1.direction == "nadir" and cam2.direction == "nadir")
+    if not both_nadir and scene_center is not None and scene_radius is not None:
         win = _target_crop_window(
             cam1_s.K, cam1_s.R, cam1_s.t, H1,
             scene_center, scene_radius, ground_z, rect_size,
